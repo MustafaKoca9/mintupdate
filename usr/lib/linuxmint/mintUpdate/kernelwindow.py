@@ -37,10 +37,14 @@ class RefreshKernelsThread(threading.Thread):
         self.application = application
 
     def run(self):
-        kernels = subprocess.run(["/usr/lib/linuxmint/mintUpdate/checkKernels.py", CONFIGURED_KERNEL_TYPE],
-            stdout=subprocess.PIPE).stdout.decode()
-        self.application.build_kernels_list(kernels)
-        self.application.refresh_kernels_list_done()
+        try:
+            kernels = subprocess.run(["/usr/lib/linuxmint/mintUpdate/checkKernels.py", CONFIGURED_KERNEL_TYPE],
+                stdout=subprocess.PIPE).stdout.decode()
+            self.application.build_kernels_list(kernels)
+            self.application.refresh_kernels_list_done()
+        except subprocess.CalledProcessError as e:
+            # Hata yönetimi: checkKernels.py çalıştırılırken hata oluşursa kullanıcıya bildirin.
+            self.application.show_error_dialog(_("Kernel listesini yenileme hatası"), str(e))
 
 class InstallKernelThread(threading.Thread):
     def __init__(self, kernels, application, kernel_window):
@@ -126,10 +130,14 @@ class InstallKernelThread(threading.Thread):
             f.flush()
 
         if do_regular:
-            subprocess.run(["sudo","/usr/lib/linuxmint/mintUpdate/synaptic-workaround.py","enable"])
-            subprocess.run(cmd, stdout=self.application.logger.log, stderr=self.application.logger.log)
-            subprocess.run(["sudo","/usr/lib/linuxmint/mintUpdate/synaptic-workaround.py","disable"])
-            f.close()
+            try:
+                subprocess.run(["sudo","/usr/lib/linuxmint/mintUpdate/synaptic-workaround.py","enable"])
+                subprocess.run(cmd, stdout=self.application.logger.log, stderr=self.application.logger.log)
+                subprocess.run(["sudo","/usr/lib/linuxmint/mintUpdate/synaptic-workaround.py","disable"])
+                f.close()
+            except subprocess.CalledProcessError as e:
+                # Hata yönetimi: synaptic-workaround.py çalıştırılırken hata oluşursa kullanıcıya bildirin.
+                self.application.show_error_dialog(_("Kernel yükleme/kaldırma hatası"), str(e))
         self.application.refresh()
         self.cache = None
         Gdk.threads_enter()
@@ -634,3 +642,5 @@ class KernelWindow():
     @staticmethod
     def confirmation_listbox_sort(row_1, row_2):
         return row_1.kernel.version < row_2.kernel.version
+
+
