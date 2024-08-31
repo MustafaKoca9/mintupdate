@@ -8,6 +8,7 @@ import re
 import sys
 import traceback
 import html
+from subprocess import call
 
 import apt
 from gi.repository import Gio
@@ -22,25 +23,41 @@ meta_names = []
 # packages which description is incorrect in Ubuntu (usually those which were replaced by snap dependencies)
 NON_TRANSLATED_PKGS = ["firefox", "thunderbird"]
 
+class KernelUpdate:
+    def __init__(self, current_kernel, candidate_kernel, meta_packages):
+        self.current_kernel = current_kernel
+        self.candidate_kernel = candidate_kernel
+        self.meta_packages = meta_packages
+
+    def get_update_description(self):
+        return f"Mevcut çekirdek: {self.current_kernel.version}\n" \
+               f"Önerilen çekirdek: {self.candidate_kernel.version}\n" \
+               f"Meta paketler: {', '.join(self.meta_packages)}"
+
 class APTCheck():
 
     def __init__(self):
         self.settings = Gio.Settings(schema_id="com.linuxmint.updates")
         self.cache = apt.Cache()
         self.priority_updates_available = False
+        self.aliases = self.load_aliases()
 
     def load_aliases(self):
-        self.aliases = {}
-        with open("/usr/lib/linuxmint/mintUpdate/aliases") as alias_file:
-            for line in alias_file:
-                if not line.startswith('#'):
-                    splitted = line.split("#####")
-                    if len(splitted) == 4:
-                        (alias_packages, alias_name, alias_short_description, alias_description) = splitted
-                        alias_object = Alias(alias_name, alias_short_description, alias_description)
-                        for alias_package in alias_packages.split(','):
-                            alias_package = alias_package.strip()
-                            self.aliases[alias_package] = alias_object
+        aliases = {}
+        try:
+            with open("/usr/lib/linuxmint/mintUpdate/aliases") as alias_file:
+                for line in alias_file:
+                    if not line.startswith('#'):
+                        splitted = line.split("#####")
+                        if len(splitted) == 4:
+                            (alias_packages, alias_name, alias_short_description, alias_description) = splitted
+                            alias_object = Alias(alias_name, alias_short_description, alias_description)
+                            for alias_package in alias_packages.split(','):
+                                alias_package = alias_package.strip()
+                                aliases[alias_package] = alias_object
+        except FileNotFoundError:
+            print("aliases dosyası bulunamadı.")
+        return aliases
 
     def find_changes(self):
         self.cache.upgrade(True) # dist-upgrade
@@ -55,6 +72,9 @@ class APTCheck():
                     self.add_update(pkg)
 
         # Kernel updates
+        self.find_kernel_updates()
+
+    def find_kernel_updates(self):
         lts_meta_name = "linux" + CONFIGURED_KERNEL_TYPE
         _metas = [s for s in self.cache.keys() if s.startswith(lts_meta_name)]
         if CONFIGURED_KERNEL_TYPE == "-generic":
@@ -346,9 +366,9 @@ class APTCheck():
                 update.short_description = update.short_description[:-1]
             update.short_description = self.capitalize(update.short_description)
             if "& " in update.short_description:
-                update.short_description = update.short_description.replace('&', '&amp;')
+                update.short_description = update.short_description.replace('&', '&')
             if "& " in update.description:
-                update.description = update.description.replace('&', '&amp;')
+                update.description = update.description.replace('&', '&')
 
     def capitalize(self, string):
         if len(string) > 1:
@@ -356,22 +376,23 @@ class APTCheck():
         else:
             return (string)
 
+    def update_cache(self):
+        # Eşzamansız önbellek güncellemesi
+        if os.getuid() == 0 and os.path.exists("/usr/bin/mintinstall-update-pkgcache"):
+            try:
+                call(["/usr/bin/mintinstall-update-pkgcache"])
+            except Exception as e:
+                print(f"Önbellek güncellemesi hatası: {e}")
+
 if __name__ == "__main__":
     try:
         check = APTCheck()
         check.find_changes()
         check.apply_l10n_descriptions()
-        check.load_aliases()
         check.apply_aliases()
         check.clean_descriptions()
         check.serialize_updates()
-        if os.getuid() == 0 and os.path.exists("/usr/bin/mintinstall-update-pkgcache"):
-            # Spawn the cache update asynchronously
-            # We're using os.system with & here to make sure it's async and detached
-            # from the caller (which will die before the child process is finished)
-            # stdout/stderr is also directed to /dev/null so it doesn't interfere
-            # or block the output from checkAPT
-            os.system("/usr/bin/mintinstall-update-pkgcache > /dev/null 2>&1 &")
+        check.update_cache()
     except Exception as error:
         print("CHECK_APT_ERROR---EOL---")
         print(sys.exc_info()[0])
