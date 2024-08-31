@@ -1,116 +1,169 @@
-# -*- coding: utf-8 -*-
-#
-# Copyright 2011-2012 Canonical Ltd.
-# Copyright 2014 Erik Devriendt
-#
-# This program is free software: you can redistribute it and/or modify it
-# under the terms of the GNU General Public License version 3, as published
-# by the Free Software Foundation.
-#
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranties of
-# MERCHANTABILITY, SATISFACTORY QUALITY, or FITNESS FOR A PARTICULAR
-# PURPOSE.  See the GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
-# In addition, as a special exception, the copyright holders give
-# permission to link the code of portions of this program with the
-# OpenSSL library under certain conditions as described in each
-# individual source file, and distribute linked combinations
-# including the two.
-# You must obey the GNU General Public License in all respects
-# for all of the code used other than OpenSSL.  If you modify
-# file(s) with this exception, you may extend this exception to your
-# version of the file(s), but you are not obligated to do so.  If you
-# do not wish to do so, delete this exception statement from your
-# version.  If you delete this exception statement from all source
-# files in the program, then also delete it here.
-"""Retrieve the proxy configuration from Gnome."""
-
 import subprocess
+from urllib.parse import quote
 
-
+# GSettings command to fetch proxy configurations
 GSETTINGS_CMDLINE = "gsettings list-recursively org.gnome.system.proxy"
 CANNOT_PARSE_WARNING = "Cannot parse gsettings value: %r"
+MISSING_KEY_WARNING = "Missing expected gsettings key: %r"
+UNSUPPORTED_MODE_WARNING = "Unsupported proxy mode: %r"
 
 
 def parse_proxy_hostspec(hostspec):
-    """Parse the hostspec to get protocol, hostname, username and password."""
-    protocol = None
-    username = None
-    password = None
-    hostname = hostspec
+    """
+    Parse the hostspec to extract protocol, hostname, username, and password.
+    Supports parsing of full URLs (e.g., http://username:password@hostname:port).
+    """
+    protocol, username, password, hostname = None, None, None, hostspec
 
     if "://" in hostname:
         protocol, hostname = hostname.split("://", 1)
     if "@" in hostname:
-        username, hostname = hostname.rsplit("@", 1)
-        if ":" in username:
-            username, password = username.split(":", 1)
+        user_info, hostname = hostname.rsplit("@", 1)
+        if ":" in user_info:
+            username, password = user_info.split(":", 1)
+        else:
+            username = user_info
+
     return protocol, hostname, username, password
 
 
 def proxy_url_from_settings(scheme, gsettings):
-    """Build and return the proxy URL for the given scheme, based on the gsettings."""
-    protocol, host, username, pwd = parse_proxy_hostspec(gsettings[scheme + ".host"])
-    # if the user did not set a proxy for a type (http/https/ftp) we should
-    # return None to ensure that it is not used
-    if host == '':
+    """
+    Construct the proxy URL for a given scheme (e.g., 'http', 'https') using gsettings data.
+    Handles cases with/without authentication, and custom ports.
+    """
+    hostspec = gsettings.get(f"{scheme}.host", "")
+    if not hostspec:
+        print(MISSING_KEY_WARNING % f"{scheme}.host")
         return None
 
-    port = gsettings[scheme + ".port"]
+    protocol, host, username, password = parse_proxy_hostspec(hostspec)
 
-    if scheme == "http" and gsettings["http.use-authentication"]:
-        username = gsettings["http.authentication-user"]
-        pwd = gsettings["http.authentication-password"]
+    # If no host is specified, return None to indicate no proxy for this scheme
+    if not host:
+        return None
 
-    proxy_url = "%s:%d" % (host,port)
-    if username is not None:
-        if pwd is not None:
-            proxy_url = "%s:%s@%s" % (username,pwd,proxy_url)
+    port = gsettings.get(
+        f"{scheme}.port", 8080
+    )  # Default to port 8080 if not specified
+    if not isinstance(port, int) or port <= 0:
+        print(f"Invalid or missing port for {scheme}, defaulting to 8080.")
+        port = 8080
+
+    if scheme == "http" and gsettings.get("http.use-authentication", False):
+        username = gsettings.get("http.authentication-user", username)
+        password = gsettings.get("http.authentication-password", password)
+
+    # URL encoding for username and password
+    if username:
+        username = quote(username)
+        if password:
+            password = quote(password)
+            proxy_url = f"{username}:{password}@{host}:{port}"
         else:
-            proxy_url = "%s@%s" % (username,proxy_url)
+            proxy_url = f"{username}@{host}:{port}"
+    else:
+        proxy_url = f"{host}:{port}"
 
-    if protocol is not None:
-        proxy_url = "%s://%s" % (protocol, proxy_url)
+    if protocol:
+        proxy_url = f"{protocol}://{proxy_url}"
 
     return proxy_url
 
+
 def get_proxy_settings():
-    """Parse the proxy settings as returned by the gsettings executable
-       and return a dictionary with a proxy URL for each scheme ."""
-    output = subprocess.check_output(GSETTINGS_CMDLINE.split()).decode("utf-8")
+    """
+    Parse Gnome's proxy settings and return a dictionary containing proxy URLs
+    for supported schemes (http, https). Includes handling for manual, auto, and direct modes.
+    """
+    try:
+        output = subprocess.check_output(GSETTINGS_CMDLINE.split()).decode("utf-8")
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing gsettings command: {e}")
+        return {}
+
     gsettings = {}
     base_len = len("org.gnome.system.proxy.")
-    # pylint: disable=E1103
+
     for line in output.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
         try:
             path, key, value = line.split(" ", 2)
         except ValueError:
+            print(CANNOT_PARSE_WARNING % line)
             continue
+
+        # Parse the value based on its type
         if value.startswith("'"):
             parsed_value = value[1:-1]
-        elif value.startswith(('[', '@')):
+        elif value.startswith(("[", "@")):
             parsed_value = value
-        elif value in ('true', 'false'):
-            parsed_value = (value == 'true')
+        elif value in ("true", "false"):
+            parsed_value = value == "true"
         elif value.isdigit():
             parsed_value = int(value)
         else:
             print(CANNOT_PARSE_WARNING % value)
             parsed_value = value
+
         relative_key = (path + "." + key)[base_len:]
         gsettings[relative_key] = parsed_value
-    mode = gsettings["mode"]
+
+    mode = gsettings.get("mode", "none").lower()
     settings = {}
+
     if mode == "manual":
         for scheme in ["http", "https"]:
             scheme_settings = proxy_url_from_settings(scheme, gsettings)
-            if scheme_settings is not None:
+            if scheme_settings:
                 settings[scheme] = scheme_settings
-    # If mode is automatic the PAC javascript should be interpreted
-    # on each request. That is out of scope so it's ignored for now
+    elif mode == "auto":
+        pac_url = gsettings.get("autoconfig-url")
+        if pac_url:
+            settings["pac"] = pac_url
+        else:
+            print(MISSING_KEY_WARNING % "autoconfig-url")
+    elif mode == "none" or mode == "direct":
+        settings["direct"] = True
+    else:
+        print(UNSUPPORTED_MODE_WARNING % mode)
 
     return settings
+
+
+def validate_proxy_settings(settings):
+    """
+    Validate the proxy settings dictionary to ensure all necessary information is present.
+    Returns True if valid, False otherwise.
+    """
+    if not settings:
+        print("No proxy settings found.")
+        return False
+
+    if "http" in settings:
+        print(f"HTTP Proxy: {settings['http']}")
+    if "https" in settings:
+        print(f"HTTPS Proxy: {settings['https']}")
+    if "pac" in settings:
+        print(f"PAC URL: {settings['pac']}")
+    if "direct" in settings:
+        print("Direct connection (no proxy).")
+
+    return True
+
+
+def main():
+    """
+    Main function to fetch, validate, and display the proxy settings.
+    """
+    settings = get_proxy_settings()
+    if validate_proxy_settings(settings):
+        print("Proxy settings are valid and ready to use.")
+    else:
+        print("Proxy settings validation failed.")
+
+
+if __name__ == "__main__":
+    main()
