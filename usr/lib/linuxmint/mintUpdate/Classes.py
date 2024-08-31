@@ -14,6 +14,8 @@ import re
 
 gettext.install("mintupdate", "/usr/share/locale")
 
+# These updates take priority over other updates.
+# If a new version of these packages is available, nothing else is listed.
 PRIORITY_UPDATES = ["mintupdate", "mint-upgrade-info"]
 
 settings = Gio.Settings(schema_id="com.linuxmint.updates")
@@ -35,7 +37,9 @@ KERNEL_PKG_NAMES = [
     "linux-modules-VERSION-KERNELTYPE",
     "linux-modules-extra-VERSION-KERNELTYPE",
 ]
-KERNEL_PKG_NAMES.append("linux-image-extra-VERSION-KERNELTYPE")
+KERNEL_PKG_NAMES.append(
+    "linux-image-extra-VERSION-KERNELTYPE"
+)  # Naming convention in 16.04, until 4.15 series
 
 CONFIGURED_KERNEL_TYPE = settings.get_string("selected-kernel-type")
 if CONFIGURED_KERNEL_TYPE not in SUPPORTED_KERNEL_TYPES:
@@ -45,35 +49,24 @@ CONFIG_PATH = os.path.expanduser("~/.linuxmint/mintupdate")
 
 
 def get_release_dates():
+    """Get distro release dates for support duration calculation"""
     release_dates = {}
     distro_info = []
-
     if os.path.isfile("/usr/share/distro-info/ubuntu.csv"):
-        with open("/usr/share/distro-info/ubuntu.csv", "r") as f:
-            distro_info += f.readlines()
-
+        distro_info += open("/usr/share/distro-info/ubuntu.csv", "r").readlines()
     if os.path.isfile("/usr/share/distro-info/debian.csv"):
-        with open("/usr/share/distro-info/debian.csv", "r") as f:
-            distro_info += f.readlines()
-
+        distro_info += open("/usr/share/distro-info/debian.csv", "r").readlines()
     if distro_info:
         for distro in distro_info[1:]:
             try:
                 distro = distro.split(",")
-                if len(distro) < 6:
-                    continue
-
                 release_date = time.mktime(time.strptime(distro[4], "%Y-%m-%d"))
                 release_date = datetime.datetime.fromtimestamp(release_date)
                 support_end = time.mktime(time.strptime(distro[5].rstrip(), "%Y-%m-%d"))
                 support_end = datetime.datetime.fromtimestamp(support_end)
-
                 release_dates[distro[2]] = [release_date, support_end]
-            except ValueError as e:
-                print(f"ValueError: {e} for distro: {distro}")
-            except Exception as e:
-                print(f"An error occurred: {e} for distro: {distro}")
-
+            except:
+                pass
     return release_dates
 
 
@@ -83,19 +76,19 @@ class KernelVersion:
         self.version = version
         self.version_id = []
         version_id = self.version.replace("-", ".").split(".")
-
+        # Check if mainline rc kernel to ensure proper sorting vs mainline release kernels
         suffix = next((x for x in version_id if x.startswith("rc")), None)
         if not suffix:
             suffix = "z"
-
+        # Copy numeric parts from version_id to self.version_id and fill up to field_length
         for element in version_id:
             if element.isnumeric():
                 self.version_id.append("0" * (field_length - len(element)) + element)
-
-        while len(self.version_id) < 4:
+        # Installed kernels always have len(self.version_id) >= 4 at this point,
+        # create missing parts for not installed mainline kernels:
+        while len(self.version_id) < 3:
             self.version_id.append("0" * field_length)
-
-        if len(self.version_id) == 4:
+        if len(self.version_id) == 3:
             self.version_id.append(
                 "%s%s"
                 % (
@@ -108,9 +101,9 @@ class KernelVersion:
                     suffix,
                 )
             )
-        elif len(self.version_id) > 4 and len(self.version_id[4]) == 6:
-            self.version_id[4] += suffix
-
+        elif len(self.version_id[3]) == 6:
+            # installed release mainline kernel, add suffix for sorting
+            self.version_id[3] += suffix
         self.series = tuple(self.version_id[:3])
         self.shortseries = tuple(self.version_id[:2])
 
@@ -175,6 +168,7 @@ class Update:
                 ):
                     self.type = "kernel"
         else:
+            # Build the class from the input_string
             self.parse(input_string)
 
     def add_package(self, pkg):
@@ -188,6 +182,7 @@ class Update:
             return
 
         if self.main_package_name != self.source_name:
+            # Overwrite dev, dbg, common, arch packages
             for suffix in [
                 "-dev",
                 "-dbg",
@@ -272,86 +267,79 @@ class Update:
 
 
 class Alias:
-    def __init__(
-        self, name=None, short_description=None, description=None, translator=None
-    ):
+    def __init__(self, name, short_description, description):
 
-        self.translator = translator or (lambda x: x)
-        self.name = self._process_text(name)
-        self.short_description = self._process_text(short_description)
-        self.description = self._process_text(description)
+        name = name.strip()
+        short_description = short_description.strip()
+        description = description.strip()
 
-    def _process_text(self, text):
+        if name.startswith('_("') and name.endswith('")'):
+            name = _(name[3:-2])
+        if short_description.startswith('_("') and short_description.endswith('")'):
+            short_description = _(short_description[3:-2])
+        if description.startswith('_("') and description.endswith('")'):
+            description = _(description[3:-2])
 
-        if text:
-            text = text.strip()
-            if text.startswith('_("') and text.endswith('")'):
-                return self.translator(text[3:-2])
-        return text
-
-    def __repr__(self):
-
-        return f"Alias(name={self.name!r}, short_description={self.short_description!r}, description={self.description!r})"
+        self.name = name
+        self.short_description = short_description
+        self.description = description
 
 
 class UpdateTracker:
-    def __init__(self, settings, logger):
 
-        os.makedirs(CONFIG_PATH, exist_ok=True)
+    # Loads past updates from JSON file
+    def __init__(self, settings, logger):
+        os.system("mkdir -p %s" % CONFIG_PATH)
         self.path = os.path.join(CONFIG_PATH, "updates.json")
 
+        # Test case
         self.test_mode = False
-        test_path = f"/usr/share/linuxmint/mintupdate/tests/{os.getenv('MINTUPDATE_TEST', '')}.json"
+        test_path = "/usr/share/linuxmint/mintupdate/tests/%s.json" % os.getenv(
+            "MINTUPDATE_TEST"
+        )
         if os.path.exists(test_path):
-            os.makedirs(CONFIG_PATH, exist_ok=True)
-            os.system(f"cp {test_path} {self.path}")
+            os.system("mkdir -p %s" % CONFIG_PATH)
+            os.system("cp %s %s" % (test_path, self.path))
             self.test_mode = True
 
-        self.tracker_version = 1
+        self.tracker_version = 1  # version of the data structure
         self.settings = settings
         self.tracked_updates = {}
-        self.refreshed_update_names = []
+        self.refreshed_update_names = []  # updates which are seen in checkAPT
         self.today = datetime.date.today().strftime("%Y.%m.%d")
-        self.max_days = 0
-        self.oldest_since_date = self.today
-        self.active = True
+        self.max_days = 0  # oldest update (in number of days seen)
+        self.oldest_since_date = self.today  # oldest update (according to since date)
+        self.active = True  # False if the tracking was already done today
         self.security_only = self.settings.get_boolean("tracker-security-only")
         self.logger = logger
-
-        self._initialize_tracker()
-
-    def _initialize_tracker(self):
 
         try:
             with open(self.path) as f:
                 self.tracked_updates = json.load(f)
-                self._validate_tracker_data()
+                if self.tracked_updates["version"] < self.tracker_version:
+                    raise Exception()
+                if self.tracked_updates["checked"] > self.today:
+                    raise Exception()
+                if self.tracked_updates["notified"] > self.today:
+                    raise Exception()
+                if self.tracked_updates["checked"] == self.today:
+                    # We already tracked updates today
+                    self.active = False
         except Exception as e:
-            self.logger.write(f"Tracker exception: {e}")
-            self.tracked_updates = {
-                "updates": {},
-                "version": self.tracker_version,
-                "checked": self.today,
-                "notified": self.today,
-            }
+            self.logger.write("Tracker exception: " + str(e))
+            self.tracked_updates["updates"] = {}
+            self.tracked_updates["version"] = self.tracker_version
+            self.tracked_updates["checked"] = self.today
+            self.tracked_updates["notified"] = self.today
 
-    def _validate_tracker_data(self):
-
-        if (
-            self.tracked_updates["version"] < self.tracker_version
-            or self.tracked_updates["checked"] > self.today
-            or self.tracked_updates["notified"] > self.today
-        ):
-            raise Exception("Invalid tracker data")
-
-        if self.tracked_updates["checked"] == self.today:
-            self.active = False
-
+    # Updates the record for a particular update
     def update(self, update):
-
         self.refreshed_update_names.append(update.real_source_name)
         if update.real_source_name not in self.tracked_updates["updates"]:
-            update_record = {"type": update.type, "since": self.today, "days": 1}
+            update_record = {}
+            update_record["type"] = update.type
+            update_record["since"] = self.today
+            update_record["days"] = 1
             self.tracked_updates["updates"][update.real_source_name] = update_record
         else:
             update_record = self.tracked_updates["updates"][update.real_source_name]
@@ -359,117 +347,139 @@ class UpdateTracker:
             if self.today > self.tracked_updates["checked"]:
                 update_record["days"] += 1
 
-        if update.type in ["security", "kernel"] or not self.security_only:
-            self.max_days = max(self.max_days, update_record["days"])
-            self.oldest_since_date = min(self.oldest_since_date, update_record["since"])
+        if update.type in ["security", "kernel"] or (not self.security_only):
+            if self.max_days < update_record["days"]:
+                self.max_days = update_record["days"]
+            if self.oldest_since_date > update_record["since"]:
+                self.oldest_since_date = update_record["since"]
 
-    def get_days_since_date(self, date_str: str, date_format: str) -> int:
+    # Returns the number of days between today and the given date string
+    def get_days_since_date(self, string: str, date_format: str) -> int:
+        if string is None:
+            return 999
+        datetime_object = datetime.datetime.strptime(string, date_format)
+        days = (datetime.date.today() - datetime_object.date()).days
+        return days
 
-        if date_str:
-            datetime_object = datetime.datetime.strptime(date_str, date_format)
-            return (datetime.date.today() - datetime_object.date()).days
-        return 999
-
+    # Returns the number of days between today and the given timestamp
     def get_days_since_timestamp(self, timestamp: float) -> int:
-
-        if timestamp:
-            datetime_object = datetime.datetime.fromtimestamp(timestamp)
-            return (datetime.date.today() - datetime_object.date()).days
-        return 999
+        if timestamp == 0:
+            return 999
+        datetime_object = datetime.datetime.fromtimestamp(timestamp)
+        days = (datetime.date.today() - datetime_object.date()).days
+        return days
 
     def get_latest_apt_upgrade(self):
+        latest_upgrade_date = None
 
-        latest_upgrade_date = self._get_latest_upgrade_from_log(
-            "/var/log/apt/history.log"
-        )
-        if not latest_upgrade_date:
+        if os.path.exists("/var/log/apt/history.log"):
+            logs = subprocess.getoutput("cat /var/log/apt/history.log")
+            for event in logs.split("\n\n"):
+                if "Upgrade: " not in event:
+                    continue
+                end_date = None
+                for line in event.split("\n"):
+                    line = line.strip()
+                    if line.startswith("End-Date: "):
+                        end_date = line.replace("End-Date: ", "")
+                        end_date = end_date.split()[0]
+                if end_date is not None and (
+                    latest_upgrade_date is None or end_date > latest_upgrade_date
+                ):
+                    latest_upgrade_date = end_date
+
+        if latest_upgrade_date is None:
             try:
-                latest_upgrade_date = self._get_latest_upgrade_from_log(
-                    "zcat /var/log/apt/history.log*gz"
-                )
+                logs = subprocess.getoutput("zcat /var/log/apt/history.log*gz")
+                for event in logs.split("\n\n"):
+                    if "Upgrade: " not in event:
+                        continue
+                    end_date = None
+                    for line in event.split("\n"):
+                        line = line.strip()
+                        if line.startswith("End-Date: "):
+                            end_date = line.replace("End-Date: ", "")
+                            end_date = end_date.split()[0]
+                    if end_date is not None and (
+                        latest_upgrade_date is None or end_date > latest_upgrade_date
+                    ):
+                        latest_upgrade_date = end_date
             except Exception as e:
                 print("Failed to check compressed APT logs", e)
+
         return latest_upgrade_date
 
-    def _get_latest_upgrade_from_log(self, log_path):
-
-        latest_upgrade_date = None
-        logs = subprocess.getoutput(log_path)
-        for event in logs.split("\n\n"):
-            if "Upgrade: " not in event:
-                continue
-            end_date = None
-            for line in event.split("\n"):
-                line = line.strip()
-                if line.startswith("End-Date: "):
-                    end_date = line.replace("End-Date: ", "").split()[0]
-            if end_date and (
-                latest_upgrade_date is None or end_date > latest_upgrade_date
-            ):
-                latest_upgrade_date = end_date
-        return latest_upgrade_date
-
-    def notify(self) -> bool:
-
+    # Returns true if a notification is required and updates the tracker
+    # with the new notification date
+    def notify(self):
+        # Check notification enabled
         if self.settings.get_boolean("tracker-disable-notifications"):
             return False
 
+        # Check notification age
         notified_age = self.get_days_since_date(
             self.tracked_updates["notified"], "%Y.%m.%d"
         )
         if notified_age < self.settings.get_int("tracker-days-between-notifications"):
             self.logger.write(
-                f"Tracker: Notification age is too small: {notified_age} days"
+                "Tracker: Notification age is too small: %d days" % notified_age
             )
             return False
 
         notification_needed = False
 
+        # Check maximum logged-in days
         if self.max_days >= self.settings.get_int("tracker-max-days"):
-            self.logger.write(f"Tracker: Max days reached: {self.max_days} days")
+            self.logger.write("Tracker: Max days reached: %d days" % self.max_days)
             notification_needed = True
         else:
             max_age = self.get_days_since_date(self.oldest_since_date, "%Y.%m.%d")
+            # Check maximum update age
             if max_age >= self.settings.get_int("tracker-max-age"):
-                self.logger.write(f"Tracker: Max age reached: {max_age} days")
+                self.logger.write("Tracker: Max age reached: %d days" % max_age)
                 notification_needed = True
 
         if not self.test_mode:
+            # Check last time install button was pressed
             last_install_age = self.get_days_since_timestamp(
                 self.settings.get_int("install-last-run")
             )
             if last_install_age <= self.settings.get_int("tracker-grace-period"):
                 self.logger.write(
-                    f"Tracker: Mintupdate update button was pressed recently: {last_install_age} days ago"
+                    "Tracker: Mintupdate update button was pressed recently: %d days ago"
+                    % last_install_age
                 )
                 notification_needed = False
             else:
+                # Check last time APT upgraded a package
                 last_apt_upgrade = self.get_latest_apt_upgrade()
-                if last_apt_upgrade:
-                    last_apt_upgrade_age = self.get_days_since_date(
-                        last_apt_upgrade, "%Y-%m-%d"
+                last_apt_upgrade_age = self.get_days_since_date(
+                    last_apt_upgrade, "%Y-%m-%d"
+                )
+                if last_apt_upgrade_age <= self.settings.get_int(
+                    "tracker-grace-period"
+                ):
+                    self.logger.write(
+                        "Tracker: APT upgrades were taken recently: %d days ago"
+                        % last_apt_upgrade_age
                     )
-                    if last_apt_upgrade_age <= self.settings.get_int(
-                        "tracker-grace-period"
-                    ):
-                        self.logger.write(
-                            f"Tracker: APT upgrades were taken recently: {last_apt_upgrade_age} days ago"
-                        )
-                        notification_needed = False
+                    notification_needed = False
 
         if notification_needed:
             self.tracked_updates["notified"] = self.today
             return True
-        return False
+        else:
+            return False
 
+    # Records updates in JSON file and potentially notify
     def record(self):
-
-        self.tracked_updates["updates"] = {
-            name: record
-            for name, record in self.tracked_updates["updates"].items()
-            if name in self.refreshed_update_names
-        }
+        # Purge non-refreshed updates
+        for name in list(self.tracked_updates["updates"].keys()):
+            if name not in self.refreshed_update_names:
+                del self.tracked_updates["updates"][name]
+        # Update the check date
         self.tracked_updates["checked"] = self.today
+        # Write JSON
         with open(self.path, "w") as f:
             json.dump(self.tracked_updates, f, indent=2)
 
@@ -477,8 +487,8 @@ class UpdateTracker:
 try:
     gi.require_version("Flatpak", "1.0")
     from gi.repository import Flatpak
-except Exception as e:
-    print(f"Flatpak module not found: {e}")
+except:
+    pass
 
 
 class FlatpakUpdate:
@@ -491,23 +501,26 @@ class FlatpakUpdate:
         remote_ref=None,
         pkginfo=None,
     ):
-
         if op is None:
-            # JSON parsing scenario
+            # json decoding
             return
 
         self.op = op
+
+        # nullable
         self.installed_ref = installed_ref
         self.remote_ref = remote_ref
         self.pkginfo = pkginfo
+        #
 
+        # to be jsonified
         self.ref = ref
-        self.ref_name = ref.get_name() if ref else ""
-        self.metadata = op.get_metadata() if op else None
-        self.size = op.get_download_size() if op else 0
+        self.ref_name = ref.get_name()
+        self.metadata = op.get_metadata()
+        self.size = op.get_download_size()
         self.link = installer.get_homepage_url(pkginfo) if pkginfo else None
         self.flatpak_type = (
-            "app" if ref and ref.get_kind() == Flatpak.RefKind.APP else "runtime"
+            "app" if ref.get_kind() == Flatpak.RefKind.APP else "runtime"
         )
         self.old_version = ""
         self.new_version = ""
@@ -517,96 +530,100 @@ class FlatpakUpdate:
         self.real_source_name = ""
         self.source_packages = []
         self.package_names = [self.ref_name]
-        self.sub_updates: List["FlatpakUpdate"] = []
+        self.sub_updates = []
         self.origin = ""
+        ##################
 
-        self._set_versions(installed_ref, pkginfo, installer)
-        self._set_package_info(installer, pkginfo, installed_ref, ref)
+        # ideal:           old-version                     new-version
+        # versions same:   old-version (commit)            new-version (commit)
+        # no versions      commit                          commit
 
-    def _set_versions(self, installed_ref, pkginfo, installer):
-        try:
-            old_commit = installed_ref.get_commit()[:10] if installed_ref else ""
-            iref_version = installed_ref.get_appdata_version() if installed_ref else ""
-            appstream_version = installer.get_version(pkginfo) if pkginfo else ""
-            new_commit = self.op.get_commit()[:10] if self.op else ""
+        # old version
+        if installed_ref:
+            iref_version = self.installed_ref.get_appdata_version()
+            old_commit = installed_ref.get_commit()[:10]
+        else:
+            iref_version = ""
+            old_commit = ""
 
-            if iref_version and appstream_version:
-                if iref_version != appstream_version:
-                    self.old_version = iref_version
-                    self.new_version = appstream_version
-                else:
-                    self.old_version = f"{iref_version} ({old_commit})"
-                    self.new_version = f"{appstream_version} ({new_commit})"
+        appstream_version = ""
+        # new version
+        if pkginfo:
+            appstream_version = installer.get_version(pkginfo)
+
+        new_commit = op.get_commit()[:10]
+
+        if iref_version != "" and appstream_version != "":
+            if iref_version != appstream_version:
+                self.old_version = iref_version
+                self.new_version = appstream_version
             else:
-                self.old_version = old_commit
-                self.new_version = new_commit
-        except Exception as e:
-            logging.error(f"Error setting versions: {e}")
+                self.old_version = "%s (%s)" % (iref_version, old_commit)
+                self.new_version = "%s (%s)" % (appstream_version, new_commit)
+        else:
+            self.old_version = old_commit
+            self.new_version = new_commit
 
-    def _set_package_info(self, installer, pkginfo, installed_ref, ref):
+        if pkginfo:
+            self.name = installer.get_display_name(pkginfo)
+        elif installed_ref and self.flatpak_type != "runtime":
+            self.name = installed_ref.get_appdata_name()
+        else:
+            self.name = ref.get_name()
 
-        try:
-            if pkginfo:
-                self.name = installer.get_display_name(pkginfo)
-                self.summary = installer.get_summary(pkginfo)
-                self.description = installer.get_description(pkginfo)
-            elif installed_ref and self.flatpak_type != "runtime":
-                self.name = installed_ref.get_appdata_name()
-                self.summary = installed_ref.get_appdata_summary()
-                self.description = ""
-            else:
-                self.name = ref.get_name() if ref else ""
-                self.summary = ""
-                self.description = ""
+        if pkginfo:
+            self.summary = installer.get_summary(pkginfo)
+            self.description = installer.get_description(pkginfo)
+        elif installed_ref:
+            self.summary = installed_ref.get_appdata_summary()
+            self.description = ""
+        else:
+            self.summary = ""
+            self.description = ""
 
-            if not self.description and self.flatpak_type == "runtime":
-                self.summary = self.description = "A Flatpak runtime package"
+        if self.description == "" and self.flatpak_type == "runtime":
+            self.summary = self.description = _("A Flatpak runtime package")
 
-            self.real_source_name = self.ref_name
-            self.source_packages = [f"{self.ref_name}={self.new_version}"]
-            self.package_names = [self.ref_name]
-            self.sub_updates = []
+        self.real_source_name = self.ref_name
+        self.source_packages = ["%s=%s" % (self.ref_name, self.new_version)]
+        self.package_names = [self.ref_name]
+        self.sub_updates = []
 
-            self.origin = (
-                installed_ref.get_origin().capitalize()
-                if installed_ref
-                else remote_ref.get_remote_name()
-                if remote_ref
-                else ""
-            )
-        except Exception as e:
-            logging.error(f"Error setting package info: {e}")
+        if installed_ref:
+            self.origin = installed_ref.get_origin().capitalize()
+        elif remote_ref:
+            self.origin = remote_ref.get_remote_name()
+        else:
+            self.origin = ""
 
     def add_package(self, update):
+        self.sub_updates.append(update)
+        self.package_names.append(update.ref_name)
+        self.size += update.size
+        # self.source_packages.append("%s=%s" % (update.ref_name, update.new_version))
 
-        if hasattr(update, "ref_name") and hasattr(update, "size"):
-            self.sub_updates.append(update)
-            self.package_names.append(update.ref_name)
-            self.size += update.size
+    def to_json(self):
+        trimmed_dict = {}
 
-    def to_json(self) -> dict:
+        for key in (
+            "flatpak_type",
+            "name",
+            "origin",
+            "old_version",
+            "new_version",
+            "size",
+            "summary",
+            "description",
+            "real_source_name",
+            "source_packages",
+            "package_names",
+            "sub_updates",
+            "link",
+        ):
+            trimmed_dict[key] = self.__dict__[key]
+        trimmed_dict["metadata"] = self.metadata.to_data()[0]
+        trimmed_dict["ref"] = self.ref.format_ref()
 
-        trimmed_dict = {
-            "flatpak_type": self.flatpak_type,
-            "name": self.name,
-            "origin": self.origin,
-            "old_version": self.old_version,
-            "new_version": self.new_version,
-            "size": self.size,
-            "summary": self.summary,
-            "description": self.description,
-            "real_source_name": self.real_source_name,
-            "source_packages": self.source_packages,
-            "package_names": self.package_names,
-            "sub_updates": [
-                update.to_json()
-                for update in self.sub_updates
-                if hasattr(update, "to_json")
-            ],
-            "link": self.link,
-            "metadata": self.metadata.to_data()[0] if self.metadata else None,
-            "ref": self.ref.format_ref() if self.ref else "",
-        }
         return trimmed_dict
 
     @classmethod
